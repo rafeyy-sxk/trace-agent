@@ -24,6 +24,8 @@ const planSchema = z.object({
 });
 
 export const MAX_AGENTS = 100;
+/** Headroom for chain-of-thought before the planner writes any JSON. */
+export const PLANNER_REASONING_ALLOWANCE = 1_500;
 
 /**
  * Angles used when the model cannot produce a plan. Not filler: each one is a
@@ -124,12 +126,22 @@ export async function planSubGoals(options: PlanOptions): Promise<PlanResult> {
         { role: 'user', content: buildPlannerPrompt(options.goal, count) },
       ],
       temperature: 0.4,
-      maxTokens: options.maxTokens ?? Math.min(4_000, 120 + count * 60),
+      // Reasoning models charge their chain of thought to the completion
+      // budget. Sizing this for the JSON alone truncates the JSON: measured
+      // live, a 20-item plan spent 764 reasoning tokens before writing a
+      // single character of output.
+      maxTokens: options.maxTokens ?? Math.min(8_000, PLANNER_REASONING_ALLOWANCE + count * 120),
       ...(options.signal ? { signal: options.signal } : {}),
     });
 
     const parsed = parseJsonLoose(response.content);
-    if (!parsed) throw new Error('planner returned no parseable JSON');
+    if (!parsed) {
+      throw new Error(
+        response.finishReason === 'length'
+          ? `planner output was cut off at the ${options.maxTokens ?? 'default'} token cap (finish_reason=length)`
+          : 'planner returned no parseable JSON',
+      );
+    }
     const validated = planSchema.safeParse(parsed.value);
     if (!validated.success) {
       throw new Error(`planner JSON did not match the schema: ${validated.error.issues[0]?.message}`);

@@ -77,6 +77,63 @@ function dropTrailingCommas(json: string): string {
   return json.replace(/,(\s*[}\]])/g, '$1');
 }
 
+/**
+ * Repair JSON that was cut off mid-value by a completion token cap.
+ *
+ * Reasoning models charge their chain of thought to the completion budget, so a
+ * cap sized for the answer alone truncates the answer. Observed live on
+ * 2026-09-16: the swarm planner spent 764 of its 1,320 completion tokens on
+ * reasoning and its JSON array was cut mid-object, so a 20-agent plan silently
+ * degraded to the deterministic fallback.
+ *
+ * The repair is conservative: rewind to the last COMPLETE element and close the
+ * open brackets. A partial element is discarded, never guessed at.
+ */
+export function repairTruncatedJson(raw: string): string | null {
+  const text = stripCodeFences(raw).trim();
+  const start = text.search(/[[{]/);
+  if (start === -1) return null;
+
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  // Index just past the last element that closed while nested inside a container.
+  let lastSafeEnd = -1;
+  let lastSafeStack: string[] = [];
+
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i] as string;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === '{' || char === '[') {
+      stack.push(char === '{' ? '}' : ']');
+      continue;
+    }
+    if (char === '}' || char === ']') {
+      if (stack.pop() !== char) return null;
+      if (stack.length > 0) {
+        lastSafeEnd = i + 1;
+        lastSafeStack = [...stack];
+      } else {
+        // The whole value closed cleanly; nothing to repair.
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  if (lastSafeEnd === -1) return null;
+  const closers = [...lastSafeStack].reverse().join('');
+  return text.slice(start, lastSafeEnd) + closers;
+}
+
 export interface JsonRepairResult {
   readonly value: unknown;
   readonly repaired: boolean;
@@ -84,22 +141,37 @@ export interface JsonRepairResult {
 
 /** Parse JSON, then try progressively more forgiving repairs. */
 export function parseJsonLoose(raw: string): JsonRepairResult | null {
-  const attempts: Array<{ text: string; repaired: boolean }> = [];
   const trimmed = raw.trim();
-  attempts.push({ text: trimmed, repaired: false });
   const unfenced = stripCodeFences(trimmed);
-  if (unfenced !== trimmed) attempts.push({ text: unfenced, repaired: true });
-  const balanced = extractBalancedJson(unfenced);
-  if (balanced && balanced !== unfenced) attempts.push({ text: balanced, repaired: true });
-  for (const attempt of [...attempts]) {
-    const cleaned = dropTrailingCommas(attempt.text);
-    if (cleaned !== attempt.text) attempts.push({ text: cleaned, repaired: true });
+
+  /**
+   * Order matters. Truncation repair must be tried BEFORE pulling out a
+   * balanced substring: given `{"subgoals":[{"a":1},{"a":` the substring
+   * extractor happily returns the nested `{"a":1}`, which parses, which would
+   * silently hand back one item from a plan of twenty.
+   */
+  const candidates: Array<{ text: string; repaired: boolean }> = [
+    { text: trimmed, repaired: false },
+  ];
+  if (unfenced !== trimmed) candidates.push({ text: unfenced, repaired: true });
+
+  const salvaged = repairTruncatedJson(unfenced);
+  if (salvaged !== null && salvaged !== unfenced) {
+    candidates.push({ text: salvaged, repaired: true });
   }
 
-  for (const attempt of attempts) {
-    if (attempt.text.length === 0) continue;
+  const balanced = extractBalancedJson(unfenced);
+  if (balanced && balanced !== unfenced) candidates.push({ text: balanced, repaired: true });
+
+  for (const candidate of [...candidates]) {
+    const cleaned = dropTrailingCommas(candidate.text);
+    if (cleaned !== candidate.text) candidates.push({ text: cleaned, repaired: true });
+  }
+
+  for (const candidate of candidates) {
+    if (candidate.text.length === 0) continue;
     try {
-      return { value: JSON.parse(attempt.text) as unknown, repaired: attempt.repaired };
+      return { value: JSON.parse(candidate.text) as unknown, repaired: candidate.repaired };
     } catch {
       // try the next repair
     }

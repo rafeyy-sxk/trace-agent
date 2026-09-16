@@ -188,7 +188,7 @@ pnpm lint
 pnpm test
 ```
 
-**216 tests across 13 files, no network, no API key.** The setup file replaces the global `fetch`
+**225 tests across 13 files, no network, no API key** (plus 10 opt-in live tests, skipped by default). The setup file replaces the global `fetch`
 with a thrower, so a test that reaches the internet fails loudly and by name instead of becoming
 slow and flaky. Every module that makes requests takes an injected `fetchImpl` precisely so that
 guard can stay on.
@@ -207,6 +207,90 @@ mocked, trace sharing, and the HTML extractor against a real 1.9 MB Wikipedia pa
 
 There is one **opt-in live** suite, `src/lib/net/ssrf-live.test.ts`, skipped unless
 `TRACE_AGENT_LIVE=1`. It proves the SSRF refusals against real listening sockets rather than mocks.
+
+Exit codes, all measured on 2026-09-16:
+
+```
+pnpm typecheck  0
+pnpm lint       0
+pnpm test       0     225 passed | 10 skipped (235)
+next build      0
+```
+
+---
+
+## Measured, not estimated
+
+Every number below was produced by the app and read out of its own event stream. Nothing here is
+rounded up.
+
+### Single agent — "What is the current population of Tokyo and how does it compare to New York, with sources"
+
+`openai/gpt-oss-120b`, step budget 6. Run of 2026-09-16.
+
+| | |
+|---|---|
+| Steps used | 6 of 6 |
+| Model calls | 7 |
+| Tool calls | 6 across 3 tools (`wikipedia`, `fetch_url`, `calculator`) |
+| Tokens | 19,663 |
+| Citations extracted from tool results | 6 |
+| 429s absorbed by the client | 2, each a ~120 s wait, both visible in the trace |
+| Wall clock | 373 s, of which roughly 245 s was rate-limit waiting |
+| Final status | `budget-exhausted` — the step budget ran out and the forced final answer produced a real answer |
+
+It found Tokyo 14,254,039 (May 2025) and New York City 8,584,629 (2025 estimate) by fetching both
+Wikipedia articles, then used the calculator for the difference (5,669,410) and the ratio (1.66)
+rather than doing the arithmetic in its head. Both figures were confirmed by hand against the same
+pages afterwards.
+
+### Swarm — 20 agents, "Give me a complete briefing on the current state of nuclear fusion energy"
+
+20 agents, concurrency 8, 2 steps each, on a free-tier key. Run of 2026-09-16.
+
+| | |
+|---|---|
+| Dispatched | 20 |
+| Completed | 20 |
+| Failed | 0 |
+| Cancelled | 0 |
+| **429s seen** | **0** |
+| Retries absorbed | 0 (none were needed) |
+| Max concurrency reached | 8 of 8 configured — measured, not assumed |
+| Model calls | 59 |
+| Tool calls | 37 |
+| Total tokens | 90,858 (66,217 prompt, 24,641 completion) |
+| **Peak tokens in any 60 s window** | **7,197 against a 7,200 ceiling** |
+| Provider limit reported by the header | 8,000/min |
+| Time agents spent held at the gate | 6,006,227 ms summed across all 20 |
+| Wall clock | 968,956 ms — 16 min 9 s |
+| Citations collected | 48 |
+| Merged answer | 28,893 characters, synthesised by one extra model call, all 20 agents contributing |
+
+**Zero rate limits across 59 model calls and 90,858 tokens on an 8,000-tokens-per-minute key, with
+the window peaking at 7,197 of 7,200.** That is the scheduler doing its job. The cost is honest and
+visible: 16 minutes of wall clock, most of it agents waiting at the gate.
+
+**The same run also exposed a defect, which is reported here rather than hidden.** The planner call
+fell back to the deterministic plan, because its completion budget was sized for the JSON and the
+model spent 764 of those tokens on chain-of-thought before writing any. The swarm still completed —
+that is what the fallback is for — but the plan was generic instead of goal-specific. Fixed, with a
+larger reasoning allowance, explicit truncation detection, and a repair that salvages complete
+entries from JSON cut off mid-array.
+
+### Swarm — 6 agents, after the planner fix
+
+| | |
+|---|---|
+| Plan source | **model-written** (was `fallback` before the fix) |
+| Dispatched / completed / failed | 6 / 6 / 0 |
+| 429s seen | 0 |
+| Max concurrency reached | 4 of 4 |
+| Model calls | 13 |
+| Tool calls | 6 |
+| Total tokens | 15,906 |
+| Peak tokens in a 60 s window | 6,930 of 7,200 |
+| Wall clock | 126 s |
 
 ---
 
@@ -262,6 +346,11 @@ the code. Each has a regression test named after what went wrong.
 7. **The scheduler could not see a rate limit.** The agent loop absorbed a 429 into a trace status
    rather than throwing, so the swarm applied generic exponential backoff and silently ignored the
    provider's own `retry-after`. The retry-after now travels with the trace.
+8. **The 20-agent swarm planned itself generically.** The planner's completion budget did not account
+   for chain-of-thought, which on these models is charged to completion, so its JSON was cut off and
+   a 20-agent plan silently degraded to the deterministic fallback. Fixed with a reasoning allowance,
+   an explicit `finish_reason=length` diagnosis, and a conservative repair that salvages the complete
+   entries from a truncated array and discards the partial one rather than guessing at it.
 
 ---
 

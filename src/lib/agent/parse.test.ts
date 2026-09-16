@@ -7,6 +7,7 @@ import {
   parseModelStep,
   recoverFromFailedGeneration,
   recoverToolCallFromText,
+  repairTruncatedJson,
   resolveToolName,
   stripCodeFences,
 } from './parse';
@@ -149,5 +150,48 @@ describe('tool name recovery — the provider rejected the model output', () => 
       TOOL_SET,
     );
     expect(recovered?.args).toEqual({ expression: '2+2' });
+  });
+});
+
+describe('truncated JSON repair — a token cap cut the answer off', () => {
+  it('should salvage the complete elements from a plan cut mid-object', () => {
+    // The exact shape seen live: reasoning ate the completion budget and the
+    // array was cut inside the third element.
+    const truncated =
+      '{"subgoals":[{"title":"Overview","goal":"Summarise the field."},' +
+      '{"title":"Funding","goal":"Find the public money spent."},' +
+      '{"title":"Timel';
+    const repaired = repairTruncatedJson(truncated);
+    expect(repaired).not.toBeNull();
+    const parsed = JSON.parse(repaired as string) as { subgoals: unknown[] };
+    expect(parsed.subgoals).toHaveLength(2);
+  });
+
+  it('should be reachable through parseJsonLoose', () => {
+    const truncated = '{"subgoals":[{"title":"A","goal":"first"},{"title":"B","goal":"seco';
+    const parsed = parseJsonLoose(truncated);
+    expect(parsed?.repaired).toBe(true);
+    expect((parsed?.value as { subgoals: unknown[] }).subgoals).toHaveLength(1);
+  });
+
+  it('should leave already-complete JSON untouched', () => {
+    expect(repairTruncatedJson('{"a":[1,2]}')).toBe('{"a":[1,2]}');
+  });
+
+  it('should discard a partial element rather than guess at it', () => {
+    const repaired = repairTruncatedJson('{"items":[{"id":1},{"id":');
+    const parsed = JSON.parse(repaired as string) as { items: Array<{ id: number }> };
+    expect(parsed.items).toEqual([{ id: 1 }]);
+  });
+
+  it('should return null when nothing complete was produced', () => {
+    expect(repairTruncatedJson('{"subgoals":[{"title":"onl')).toBeNull();
+    expect(repairTruncatedJson('no json here')).toBeNull();
+  });
+
+  it('should not be confused by brackets inside strings', () => {
+    const repaired = repairTruncatedJson('{"a":[{"s":"a}b]c"},{"s":"part');
+    const parsed = JSON.parse(repaired as string) as { a: Array<{ s: string }> };
+    expect(parsed.a).toEqual([{ s: 'a}b]c' }]);
   });
 });

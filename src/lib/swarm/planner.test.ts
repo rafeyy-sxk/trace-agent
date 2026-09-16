@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { scriptedChat } from '@/test/mocks';
-import { fallbackPlan, MAX_AGENTS, planSubGoals } from './planner';
+import { fallbackPlan, MAX_AGENTS, planSubGoals, PLANNER_REASONING_ALLOWANCE } from './planner';
 
 describe('fallbackPlan', () => {
   it('should produce exactly the requested number of distinct sub-goals', () => {
@@ -96,5 +96,43 @@ describe('planSubGoals', () => {
     const plan = await planSubGoals({ goal: 'fusion', count: 1, model: 'm', chat: chat.fn });
     expect(chat.callCount()).toBe(0);
     expect(plan.subGoals[0]?.goal).toBe('fusion');
+  });
+});
+
+describe('planner token budget — the live fallback', () => {
+  it('should allow enough completion budget for chain of thought before the JSON', async () => {
+    // Live 20-agent swarm on 2026-09-16 fell back to the deterministic plan.
+    // Cause: maxTokens was 1320 and the model spent 764 of it reasoning.
+    const chat = scriptedChat([{ content: JSON.stringify({ subgoals: [] }) }]);
+    await planSubGoals({ goal: 'fusion', count: 20, model: 'm', chat: chat.fn });
+    const maxTokens = chat.requests[0]?.maxTokens ?? 0;
+    expect(maxTokens).toBeGreaterThanOrEqual(PLANNER_REASONING_ALLOWANCE + 20 * 100);
+    expect(maxTokens).toBeGreaterThan(1_320);
+  });
+
+  it('should name truncation as the cause when the model ran out of tokens', async () => {
+    const chat = scriptedChat([
+      { content: '{"subgoals":[{"title":"onl', finishReason: 'length' },
+    ]);
+    const plan = await planSubGoals({ goal: 'fusion', count: 5, model: 'm', chat: chat.fn });
+    expect(plan.source).toBe('fallback');
+    expect(plan.error).toContain('cut off');
+    expect(plan.error).toContain('finish_reason=length');
+  });
+
+  it('should salvage a plan that was truncated but held complete entries', async () => {
+    const chat = scriptedChat([
+      {
+        content:
+          '{"subgoals":[{"title":"A","goal":"Research the first angle."},' +
+          '{"title":"B","goal":"Research the second angle."},{"title":"C","goal":"Resea',
+        finishReason: 'length',
+      },
+    ]);
+    const plan = await planSubGoals({ goal: 'fusion', count: 4, model: 'm', chat: chat.fn });
+    expect(plan.source).toBe('model');
+    expect(plan.subGoals).toHaveLength(4);
+    expect(plan.subGoals[0]?.title).toBe('A');
+    expect(plan.subGoals[1]?.title).toBe('B');
   });
 });
